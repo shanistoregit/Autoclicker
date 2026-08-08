@@ -2,10 +2,11 @@ package com.shanistore.autoclicker
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.TextUtils
 import android.text.method.ScrollingMovementMethod
@@ -23,6 +24,11 @@ class MainActivity : AppCompatActivity() {
     private var loadedSequence: ClickSequence? = null
     private val logBuilder = StringBuilder()
 
+    // Action to run automatically once the capture service is confirmed
+    // alive after requesting permission. Lets Start Recording / Start
+    // Replay request permission and proceed in one tap.
+    private var pendingActionAfterCapturePermission: (() -> Unit)? = null
+
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -33,10 +39,13 @@ class MainActivity : AppCompatActivity() {
                 putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, result.data)
             }
             startForegroundService(intent)
-            log("Screen capture permission granted.")
-            updateStatus("Capture ready")
+            log("Screen capture permission granted. Waiting for capture service to start...")
+            updateStatus("Starting capture...")
+            waitForCaptureServiceThenRun()
         } else {
             log("Screen capture permission denied.")
+            pendingActionAfterCapturePermission = null
+            Toast.makeText(this, "Screen capture permission is required.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -70,13 +79,16 @@ class MainActivity : AppCompatActivity() {
         binding.logText.movementMethod = ScrollingMovementMethod()
 
         binding.btnEnableAccessibility.setOnClickListener { openAccessibilitySettings() }
-        binding.btnGrantCapture.setOnClickListener { requestScreenCapture() }
 
-        binding.btnStartRecording.setOnClickListener { startRecording() }
+        // Still available on its own for pre-granting, but Start
+        // Recording / Start Replay will also trigger it automatically.
+        binding.btnGrantCapture.setOnClickListener { requestScreenCapture(null) }
+
+        binding.btnStartRecording.setOnClickListener { onStartRecordingClicked() }
         binding.btnStopRecording.setOnClickListener { stopRecording() }
 
         binding.btnLoadSequence.setOnClickListener { pickSequenceFile() }
-        binding.btnStartReplay.setOnClickListener { startReplay() }
+        binding.btnStartReplay.setOnClickListener { onStartReplayClicked() }
         binding.btnStopReplay.setOnClickListener { stopReplay() }
     }
 
@@ -95,9 +107,44 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestScreenCapture() {
+    /**
+     * Requests screen capture permission. If [thenRun] is provided, it runs
+     * automatically once the capture service is confirmed alive -- this is
+     * what lets "Start Recording" / "Start Replay" request permission and
+     * proceed in a single tap, instead of needing a separate grant step first.
+     */
+    private fun requestScreenCapture(thenRun: (() -> Unit)?) {
+        pendingActionAfterCapturePermission = thenRun
         val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         screenCaptureLauncher.launch(manager.createScreenCaptureIntent())
+    }
+
+    /**
+     * Polls briefly for ScreenCaptureService.instance to become non-null
+     * after asking the system to start it (service creation is async, and
+     * instance being null right after the grant is expected for a moment).
+     * Runs the pending action once ready, or logs clearly if the service
+     * never comes up (meaning it crashed on startup).
+     */
+    private fun waitForCaptureServiceThenRun(attemptsLeft: Int = 15) {
+        if (ScreenCaptureService.instance != null) {
+            log("Capture service is ready.")
+            updateStatus("Capture ready")
+            val action = pendingActionAfterCapturePermission
+            pendingActionAfterCapturePermission = null
+            action?.invoke()
+            return
+        }
+        if (attemptsLeft <= 0) {
+            log("Capture service never came up after permission was granted -- it likely crashed on startup.")
+            updateStatus("Capture failed")
+            pendingActionAfterCapturePermission = null
+            Toast.makeText(this, "Screen capture failed to start. Try again.", Toast.LENGTH_LONG).show()
+            return
+        }
+        Handler(Looper.getMainLooper()).postDelayed({
+            waitForCaptureServiceThenRun(attemptsLeft - 1)
+        }, 200)
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
@@ -106,17 +153,13 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- Recording ----------
 
-    private fun startRecording() {
+    private fun onStartRecordingClicked() {
         if (!isAccessibilityServiceEnabled()) {
             Toast.makeText(this, "Enable the Accessibility Service first.", Toast.LENGTH_SHORT).show()
             return
         }
-        if (ScreenCaptureService.instance == null) {
-            Toast.makeText(this, "Grant screen capture permission first.", Toast.LENGTH_SHORT).show()
-            return
-        }
         if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Grant 'Display over other apps' permission.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Grant 'Display over other apps' permission, then tap Start Recording again.", Toast.LENGTH_LONG).show()
             startActivity(
                 Intent(
                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -126,6 +169,16 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        if (ScreenCaptureService.instance == null) {
+            log("Requesting screen capture permission before recording...")
+            requestScreenCapture { beginRecording() }
+            return
+        }
+
+        beginRecording()
+    }
+
+    private fun beginRecording() {
         val name = binding.sequenceNameInput.text.toString().let {
             if (TextUtils.isEmpty(it)) "sequence_${System.currentTimeMillis()}" else it
         }
@@ -182,7 +235,7 @@ class MainActivity : AppCompatActivity() {
         loadFileLauncher.launch(intent)
     }
 
-    private fun startReplay() {
+    private fun onStartReplayClicked() {
         val sequence = loadedSequence
         if (sequence == null || sequence.steps.isEmpty()) {
             Toast.makeText(this, "Load or record a sequence first.", Toast.LENGTH_SHORT).show()
@@ -192,11 +245,17 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Enable the Accessibility Service first.", Toast.LENGTH_SHORT).show()
             return
         }
+
         if (ScreenCaptureService.instance == null) {
-            Toast.makeText(this, "Grant screen capture permission first.", Toast.LENGTH_SHORT).show()
+            log("Requesting screen capture permission before replay...")
+            requestScreenCapture { beginReplay(sequence) }
             return
         }
 
+        beginReplay(sequence)
+    }
+
+    private fun beginReplay(sequence: ClickSequence) {
         val retries = binding.retryCountInput.text.toString().toIntOrNull() ?: 5
         val confidence = binding.confidenceInput.text.toString().toDoubleOrNull() ?: 0.85
 
@@ -229,7 +288,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun log(message: String) {
         logBuilder.insert(0, "$message\n")
-        // Keep log buffer bounded
         if (logBuilder.length > 4000) logBuilder.setLength(4000)
         binding.logText.text = logBuilder.toString()
     }
