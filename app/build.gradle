@@ -53,7 +53,7 @@ dependencies {
     implementation 'androidx.lifecycle:lifecycle-service:2.8.4'
 
     // OpenCV for Android (template matching)
-    implementation 'org.quickbirdstudios:opencv:4.5.3.0'
+    implementation 'org.opencv:opencv:4.10.0'
 
     // JSON parsing for .autoclick save/load
     implementation 'org.json:json:20240303'
