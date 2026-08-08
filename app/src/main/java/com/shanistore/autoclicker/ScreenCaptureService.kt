@@ -23,16 +23,6 @@ import android.util.DisplayMetrics
 import android.util.Log
 import androidx.core.app.NotificationCompat
 
-/**
- * Foreground service that owns the MediaProjection screen-capture session.
- * Used both for:
- *  - Recording: grabbing a screenshot around each tap the user makes
- *  - Replay: continuously capturing frames to search for template images
- *
- * Broadcasts frames/status back to whoever is listening (MainActivity or
- * the AutomationEngine) via a simple in-process listener rather than
- * Android broadcasts, since everything runs in the same process.
- */
 class ScreenCaptureService : Service() {
 
     companion object {
@@ -78,7 +68,21 @@ class ScreenCaptureService : Service() {
             ACTION_START -> {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
                 val resultData: Intent? = intent.getParcelableExtra(EXTRA_RESULT_DATA)
-                startForeground(NOTIFICATION_ID, buildNotification())
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(
+                            NOTIFICATION_ID,
+                            buildNotification(),
+                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                        )
+                    } else {
+                        startForeground(NOTIFICATION_ID, buildNotification())
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "startForeground failed", e)
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 if (resultData != null) {
                     startCapture(resultCode, resultData)
                 }
@@ -113,46 +117,53 @@ class ScreenCaptureService : Service() {
     }
 
     private fun startCapture(resultCode: Int, resultData: Intent) {
-        val projectionManager =
-            getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
+        try {
+            val projectionManager =
+                getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
 
-        val metrics = DisplayMetrics()
-        val windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(metrics)
+            val metrics = DisplayMetrics()
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val display = displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
 
-        screenWidth = metrics.widthPixels
-        screenHeight = metrics.heightPixels
-        screenDensity = metrics.densityDpi
+            screenWidth = metrics.widthPixels
+            screenHeight = metrics.heightPixels
+            screenDensity = metrics.densityDpi
 
-        handlerThread = HandlerThread("ScreenCaptureThread").apply { start() }
-        handler = Handler(handlerThread!!.looper)
+            handlerThread = HandlerThread("ScreenCaptureThread").apply { start() }
+            handler = Handler(handlerThread!!.looper)
 
-        imageReader = ImageReader.newInstance(
-            screenWidth, screenHeight, PixelFormat.RGBA_8888, 2
-        )
+            imageReader = ImageReader.newInstance(
+                screenWidth, screenHeight, PixelFormat.RGBA_8888, 2
+            )
 
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "AutoClickerCapture",
-            screenWidth, screenHeight, screenDensity,
-            android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, handler
-        )
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "AutoClickerCapture",
+                screenWidth, screenHeight, screenDensity,
+                android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader?.surface, null, handler
+            )
 
-        imageReader?.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireLatestImage()
-            if (image != null) {
-                val bitmap = imageToBitmap(image)
-                image.close()
-                if (bitmap != null) {
-                    latestFrame = bitmap
-                    frameListener?.onFrame(bitmap)
+            imageReader?.setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage()
+                if (image != null) {
+                    val bitmap = imageToBitmap(image)
+                    image.close()
+                    if (bitmap != null) {
+                        latestFrame = bitmap
+                        frameListener?.onFrame(bitmap)
+                    }
                 }
-            }
-        }, handler)
+            }, handler)
 
-        Log.d(TAG, "Capture started: ${screenWidth}x${screenHeight}")
+            Log.d(TAG, "Capture started: ${screenWidth}x${screenHeight}")
+        } catch (e: Exception) {
+            Log.e(TAG, "startCapture failed", e)
+            stopCapture()
+            stopSelf()
+        }
     }
 
     private fun imageToBitmap(image: Image): Bitmap? {
@@ -170,7 +181,6 @@ class ScreenCaptureService : Service() {
             )
             bitmap.copyPixelsFromBuffer(buffer)
 
-            // Crop off row padding if present
             if (rowPadding == 0) {
                 bitmap
             } else {
@@ -182,7 +192,6 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    /** Grabs a single fresh frame synchronously-ish (returns latest available). */
     fun captureSingleFrame(): Bitmap? = latestFrame
 
     private fun stopCapture() {
