@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Shani AutoClicker</string>
+    <string name="accessibility_service_description">Allows Shani AutoClicker to tap on detected images automatically.</string>
+</resources>
