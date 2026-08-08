@@ -10,7 +10,6 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven { url 'https://raw.githubusercontent.com/quickbirdstudios/opencv-android-releases/master/repository' }
     }
 }
 rootProject.name = "AutoClicker"
